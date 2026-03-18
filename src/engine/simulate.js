@@ -18,13 +18,19 @@ function generateSyntheticReturns(params) {
   const crashStartDate = new Date(crashStart);
   const totalMonths = monthDiff(start, end);
 
-  const baseMonthlyReturn = Math.pow(1.10, 1 / 12) - 1; // ~10% p.a.
-  const crashEndDate = addMonths(crashStartDate, crashDuration);
-  const recoveryEndDate = addMonths(crashEndDate, recoveryPace);
+  const baseMonthlyReturn = Math.pow(1.10, 1 / 12) - 1; // ~10% p.a. total return
 
   const returns = [];
   const audReturns = [];
   const audCrashDepth = 0.15;
+
+  // Crash: multiplicative monthly return to reach exact crashDepth over crashDuration months
+  // (1 + r)^n = (1 - crashDepth), so r = (1-crashDepth)^(1/n) - 1
+  const crashMonthlyReturn = Math.pow(1 - crashDepth, 1 / crashDuration) - 1;
+  const audCrashMonthlyReturn = Math.pow(1 - audCrashDepth, 1 / crashDuration) - 1;
+
+  // Track actual crash-end level for recovery curve
+  const crashEndLevel = 1 - crashDepth; // exact target after crash
 
   for (let m = 0; m < totalMonths; m++) {
     const currentDate = addMonths(start, m);
@@ -37,27 +43,25 @@ function generateSyntheticReturns(params) {
       // Pre-crash: normal growth
       monthReturn = baseMonthlyReturn;
     } else if (monthsSinceCrashStart >= 0 && monthsSinceCrashStart < crashDuration) {
-      // Crash phase: linear drawdown
-      const monthlyDrop = crashDepth / crashDuration;
-      monthReturn = -monthlyDrop;
-      audReturn = -audCrashDepth / crashDuration;
+      // Crash phase: multiplicative drawdown to reach exact crashDepth
+      monthReturn = crashMonthlyReturn;
+      audReturn = audCrashMonthlyReturn;
     } else if (monthsSinceCrashStart >= crashDuration && monthsSinceCrashStart < crashDuration + recoveryPace) {
-      // Recovery phase: logarithmic recovery
+      // Recovery phase: quadratic ease-out from crashEndLevel back to 1.0
       const recoveryMonth = monthsSinceCrashStart - crashDuration;
       const t1 = recoveryMonth / recoveryPace;
       const t2 = (recoveryMonth + 1) / recoveryPace;
-      // Log recovery curve: level = (1 - crashDepth) + crashDepth * log(1 + t*e - t) / log(e)
-      // Simplified: use diminishing returns curve
-      const level1 = (1 - crashDepth) + crashDepth * (1 - Math.pow(1 - t1, 2));
-      const level2 = (1 - crashDepth) + crashDepth * (1 - Math.pow(1 - t2, 2));
+      const level1 = crashEndLevel + (1 - crashEndLevel) * (1 - Math.pow(1 - t1, 2));
+      const level2 = crashEndLevel + (1 - crashEndLevel) * (1 - Math.pow(1 - t2, 2));
       monthReturn = (level2 - level1) / level1;
 
-      // AUD recovery: slower
+      // AUD recovery: slower (2x recovery pace)
+      const audCrashEnd = 1 - audCrashDepth;
       const audRecoveryPace = recoveryPace * 2;
       const audT1 = Math.min(recoveryMonth / audRecoveryPace, 1);
       const audT2 = Math.min((recoveryMonth + 1) / audRecoveryPace, 1);
-      const audLevel1 = (1 - audCrashDepth) + audCrashDepth * (1 - Math.pow(1 - audT1, 2));
-      const audLevel2 = (1 - audCrashDepth) + audCrashDepth * (1 - Math.pow(1 - audT2, 2));
+      const audLevel1 = audCrashEnd + (1 - audCrashEnd) * (1 - Math.pow(1 - audT1, 2));
+      const audLevel2 = audCrashEnd + (1 - audCrashEnd) * (1 - Math.pow(1 - audT2, 2));
       audReturn = (audLevel2 - audLevel1) / audLevel1;
     } else {
       // Post-recovery: normal growth
@@ -73,35 +77,35 @@ function generateSyntheticReturns(params) {
 
 export function runSimulation(params) {
   const {
-    simStart, simEnd, crashStart, crashDepth, crashDuration, recoveryPace,
+    simStart, crashStart, crashDuration,
     rbaCashRate, crisisCreditSpread, startingLVR,
-    dcaAmount, initialInvestment,
-    enableTxCosts, enableCurrencyEffect, enableVolatilityDrag,
+    initialInvestment,
+    enableTxCosts, enableCurrencyEffect,
   } = params;
 
   const start = new Date(simStart);
   const crashStartDate = new Date(crashStart);
-  const crashEndDate = addMonths(crashStartDate, crashDuration);
 
   const { returns, audReturns, totalMonths } = generateSyntheticReturns(params);
 
-  // DHHF constants
   const dhhfFeeMonthly = 0.0019 / 12;
-  const dhhfDividendMonthly = 0.035 / 12;
-
-  // GHHF constants
   const ghhfFeeMonthly = 0.0035 / 12;
-  const ghhfDividendMonthly = 0.025 / 12;
-  const grossExposure = 1 + startingLVR / 100; // e.g. 1.35
+
+  // LVR = debt / gross, so gross = equity / (1 - LVR)
+  const lvrDecimal = startingLVR / 100;
+  const grossExposure = 1 / (1 - lvrDecimal);
 
   const output = [];
   let dhhfNav = 100;
-  let ghhfNav = 100;
   let ghhfGross = initialInvestment * grossExposure;
-  let ghhfDebt = initialInvestment * (startingLVR / 100);
+  let ghhfDebt = ghhfGross - initialInvestment;
   let ghhfEquity = initialInvestment;
   let audIndex = 100;
   let prevDca = null;
+
+  // Accumulators for KPIs
+  let totalInterestPaid = 0;
+  let totalFeesPaid = 0;
 
   for (let m = 0; m < totalMonths; m++) {
     const date = addMonths(start, m);
@@ -113,66 +117,53 @@ export function runSimulation(params) {
     // Currency effect on returns (international portion ~63%)
     let effectiveReturn = marketReturn;
     if (enableCurrencyEffect && audReturns[m] !== 0) {
-      const intlPortion = 0.63; // US 41% + Dev 16% + EM 6%
+      const intlPortion = 0.63;
       const domPortion = 0.37;
       const intlReturnAud = (1 + marketReturn) / (1 + audReturns[m]) - 1;
       effectiveReturn = domPortion * marketReturn + intlPortion * intlReturnAud;
     }
 
     // --- DHHF ---
-    const dhhfReturn = effectiveReturn - dhhfFeeMonthly;
-    dhhfNav *= (1 + dhhfReturn + dhhfDividendMonthly);
+    // Total return already includes dividends; just subtract fee
+    dhhfNav *= (1 + effectiveReturn - dhhfFeeMonthly);
 
     // --- GHHF ---
-    const borrowingRate = (rbaCashRate + (isCrashPeriod ? crisisCreditSpread : crisisCreditSpread * 0.3)) / 100;
+    // Borrowing rate: full crisis spread during crash, base RBA rate + small margin outside
+    const borrowingRate = (rbaCashRate + (isCrashPeriod ? crisisCreditSpread : 0)) / 100;
     const monthlyBorrowingRate = borrowingRate / 12;
 
-    // Gross asset return
-    const ghhfMarketReturn = effectiveReturn * grossExposure;
-
-    // Volatility drag
-    let volDrag = 0;
-    if (enableVolatilityDrag) {
-      const monthlyVariance = Math.pow(marketReturn, 2);
-      volDrag = 0.5 * Math.pow(grossExposure, 2) * monthlyVariance;
-    }
-
-    // Interest cost on debt
-    const interestCost = ghhfDebt * monthlyBorrowingRate;
-
-    // Update GHHF gross assets
+    // 1. Gross assets grow by market return
     ghhfGross *= (1 + effectiveReturn);
-    ghhfGross -= ghhfGross * ghhfFeeMonthly; // Management fee on gross
-    ghhfGross -= ghhfGross * volDrag; // Vol drag
-
-    // GHHF equity = gross - debt
-    ghhfDebt += interestCost; // Interest accrues to debt
+    // 2. Management fee on gross
+    const feeThisMonth = ghhfGross * ghhfFeeMonthly;
+    ghhfGross -= feeThisMonth;
+    totalFeesPaid += feeThisMonth;
+    // 3. Interest paid from gross assets (not capitalised into debt)
+    const interestCost = ghhfDebt * monthlyBorrowingRate;
+    ghhfGross -= interestCost;
+    totalInterestPaid += interestCost;
+    // 4. Equity = gross - debt
     ghhfEquity = ghhfGross - ghhfDebt;
 
-    // Dividends (net of interest)
-    const ghhfDivs = ghhfGross * ghhfDividendMonthly;
-    ghhfEquity += ghhfDivs;
-    ghhfGross += ghhfDivs;
-
-    // LVR management
+    // LVR management (forced sales / re-gearing)
     const lvrResult = manageLVR(ghhfGross, ghhfDebt, effectiveReturn, isCrashPeriod, enableTxCosts);
     ghhfGross = lvrResult.grossAssets;
     ghhfDebt = lvrResult.debt;
     ghhfEquity = ghhfGross - ghhfDebt;
 
-    // Update GHHF NAV index (base 100)
-    ghhfNav = (ghhfEquity / initialInvestment) * 100;
+    // GHHF NAV index (base 100)
+    const ghhfNav = (ghhfEquity / initialInvestment) * 100;
 
     // AUD index
     audIndex *= (1 + audReturns[m]);
 
     // DCA
-    const dcaResult = processDCA(params, date, dhhfNav, ghhfNav, prevDca);
+    const dcaResult = processDCA(params, date, dhhfNav, Math.max(ghhfNav, 0.01), prevDca);
     prevDca = dcaResult;
 
-    // Portfolio values (initial investment)
+    // Portfolio values
     const portfolioDhhf = initialInvestment * (dhhfNav / 100);
-    const portfolioGhhf = ghhfEquity;
+    const portfolioGhhf = Math.max(ghhfEquity, 0);
 
     output.push({
       date: date.toISOString().slice(0, 7),
@@ -186,35 +177,35 @@ export function runSimulation(params) {
       forcedSale: lvrResult.forcedSale ? Math.round(lvrResult.forcedSale) : null,
       dcaUnits: dcaResult.dcaUnitsThisMonth,
       portfolioDhhf: Math.max(portfolioDhhf, 0),
-      portfolioGhhf: Math.max(portfolioGhhf, 0),
+      portfolioGhhf,
       cumulativeDca: dcaResult.cumulativeInvested,
       dcaPortfolioDhhf: dcaResult.portfolioDhhf || 0,
       dcaPortfolioGhhf: dcaResult.portfolioGhhf || 0,
     });
   }
 
-  return output;
+  return { output, totalInterestPaid, totalFeesPaid };
 }
 
 export function runHistoricalSimulation(params, navSeries, audSeries) {
   const {
     rbaCashRate, crisisCreditSpread, startingLVR,
-    dcaAmount, initialInvestment,
-    enableTxCosts, enableVolatilityDrag, crashStart, crashDuration,
+    initialInvestment,
+    enableTxCosts, crashStart, crashDuration,
   } = params;
 
   const crashStartDate = new Date(crashStart);
-
-  const dhhfFeeMonthly = 0.0019 / 12;
   const ghhfFeeMonthly = 0.0035 / 12;
-  const ghhfDividendMonthly = 0.025 / 12;
-  const grossExposure = 1 + startingLVR / 100;
+  const lvrDecimal = startingLVR / 100;
+  const grossExposure = 1 / (1 - lvrDecimal);
 
   const output = [];
   let ghhfGross = initialInvestment * grossExposure;
-  let ghhfDebt = initialInvestment * (startingLVR / 100);
+  let ghhfDebt = ghhfGross - initialInvestment;
   let ghhfEquity = initialInvestment;
   let prevDca = null;
+  let totalInterestPaid = 0;
+  let totalFeesPaid = 0;
 
   for (let i = 0; i < navSeries.length; i++) {
     const { date, nav: dhhfNav } = navSeries[i];
@@ -222,31 +213,29 @@ export function runHistoricalSimulation(params, navSeries, audSeries) {
     const monthsSinceCrash = monthDiff(crashStartDate, dateObj);
     const isCrashPeriod = monthsSinceCrash >= 0 && monthsSinceCrash < (crashDuration || 17);
 
-    // Compute GHHF from market return
+    // Market return from DHHF NAV changes
     let marketReturn = 0;
     if (i > 0) {
       marketReturn = (dhhfNav - navSeries[i - 1].nav) / navSeries[i - 1].nav;
     }
 
-    const borrowingRate = (rbaCashRate + (isCrashPeriod ? crisisCreditSpread : crisisCreditSpread * 0.3)) / 100;
+    const borrowingRate = (rbaCashRate + (isCrashPeriod ? crisisCreditSpread : 0)) / 100;
     const monthlyBorrowingRate = borrowingRate / 12;
-    const interestCost = ghhfDebt * monthlyBorrowingRate;
 
+    // 1. Gross assets grow by market return
     ghhfGross *= (1 + marketReturn);
-    ghhfGross -= ghhfGross * ghhfFeeMonthly;
-
-    if (enableVolatilityDrag) {
-      const volDrag = 0.5 * Math.pow(grossExposure, 2) * Math.pow(marketReturn, 2);
-      ghhfGross -= ghhfGross * volDrag;
-    }
-
-    ghhfDebt += interestCost;
+    // 2. Fee on gross
+    const feeThisMonth = ghhfGross * ghhfFeeMonthly;
+    ghhfGross -= feeThisMonth;
+    totalFeesPaid += feeThisMonth;
+    // 3. Interest paid from gross assets
+    const interestCost = ghhfDebt * monthlyBorrowingRate;
+    ghhfGross -= interestCost;
+    totalInterestPaid += interestCost;
+    // 4. Equity
     ghhfEquity = ghhfGross - ghhfDebt;
 
-    const ghhfDivs = ghhfGross * ghhfDividendMonthly;
-    ghhfEquity += ghhfDivs;
-    ghhfGross += ghhfDivs;
-
+    // LVR management
     const lvrResult = manageLVR(ghhfGross, ghhfDebt, marketReturn, isCrashPeriod, enableTxCosts);
     ghhfGross = lvrResult.grossAssets;
     ghhfDebt = lvrResult.debt;
@@ -277,10 +266,14 @@ export function runHistoricalSimulation(params, navSeries, audSeries) {
     });
   }
 
-  return output;
+  return { output, totalInterestPaid, totalFeesPaid };
 }
 
-export function computeKPIs(output, params) {
+export function computeKPIs(simResult, params) {
+  const output = simResult.output || simResult;
+  const totalInterestPaid = simResult.totalInterestPaid || 0;
+  const totalFeesPaid = simResult.totalFeesPaid || 0;
+
   if (!output || output.length === 0) return {};
 
   const dhhfValues = output.map(d => d.dhhfNav);
@@ -296,7 +289,7 @@ export function computeKPIs(output, params) {
     ghhfMaxDD = Math.max(ghhfMaxDD, (ghhfPeak - ghhfValues[i]) / ghhfPeak);
   }
 
-  // Recovery time (months to get back to 100 after first drop below)
+  // Recovery time
   let dhhfRecoveryMonths = null;
   let ghhfRecoveryMonths = null;
   const crashIdx = output.findIndex(d => d.dhhfNav < 100);
@@ -315,13 +308,6 @@ export function computeKPIs(output, params) {
   const forcedSales = output.filter(d => d.forcedSale !== null);
   const totalForcedSaleAmount = forcedSales.reduce((sum, d) => sum + d.forcedSale, 0);
 
-  // Interest & fees estimate
-  const totalMonths = output.length;
-  const avgDebt = params.initialInvestment * (params.startingLVR / 100);
-  const avgBorrowingRate = output.reduce((sum, d) => sum + d.borrowingRate, 0) / totalMonths / 100;
-  const totalInterest = avgDebt * avgBorrowingRate * (totalMonths / 12);
-  const totalFees = params.initialInvestment * 1.35 * 0.0035 * (totalMonths / 12);
-
   // Final values
   const finalDhhf = output[output.length - 1].portfolioDhhf;
   const finalGhhf = output[output.length - 1].portfolioGhhf;
@@ -335,8 +321,8 @@ export function computeKPIs(output, params) {
       ? ((ghhfRecoveryMonths - dhhfRecoveryMonths) / 12).toFixed(1) : 'N/A',
     forcedSaleCount: forcedSales.length,
     totalForcedSales: Math.round(totalForcedSaleAmount),
-    totalInterest: Math.round(totalInterest),
-    totalFees: Math.round(totalFees),
+    totalInterest: Math.round(totalInterestPaid),
+    totalFees: Math.round(totalFeesPaid),
     dcaTotalInvested: output[output.length - 1].cumulativeDca,
     finalDhhf: Math.round(finalDhhf),
     finalGhhf: Math.round(finalGhhf),
