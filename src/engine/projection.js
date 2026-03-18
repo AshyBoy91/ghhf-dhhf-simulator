@@ -152,17 +152,22 @@ export function runProjection(params) {
       ghhfEquity = ghhfGross - ghhfDebt;
     }
 
-    // Track dividends for franking
-    // Underlying assets earn 3.5% income on gross. Fund pays interest from that.
-    // Net distribution to investors = underlying income - interest.
-    // Franking credits pass through pro-rata on the distributed portion.
+    // Track dividends & franking credits
+    // Underlying assets earn 3.5% income on GROSS. Fund pays interest from that.
+    // Net cash distribution = gross income - interest.
+    // Franking credits are generated on the GROSS AU dividend income (1.54x more
+    // than DHHF) and pass through fully — interest doesn't reduce franking credits.
     const grossDividendIncome = ghhfGross * (UNDERLYING_DIVIDEND_YIELD / 12);
     const ghhfNetDistribution = Math.max(grossDividendIncome - monthlyInterest, 0);
     ghhfTotalDividends += ghhfNetDistribution;
-    // Franking credits: AU portion of the distribution carries franking
-    const ghhfFranking = computeFrankingBenefit(ghhfNetDistribution, GHHF_AU_WEIGHT, GHHF_FRANKING_RATE, marginalRate);
-    ghhfTotalFrankingCredits += ghhfFranking.frankingCredit;
-    ghhfTotalTaxOnDividends += ghhfFranking.netTaxOnDividends;
+    // Franking credits: based on GROSS AU dividend income, not net distribution
+    const grossAuDividend = ghhfGross * (UNDERLYING_DIVIDEND_YIELD / 12) * GHHF_AU_WEIGHT * GHHF_FRANKING_RATE;
+    const ghhfFrankingCredit = grossAuDividend * CORPORATE_TAX_RATE / (1 - CORPORATE_TAX_RATE);
+    ghhfTotalFrankingCredits += ghhfFrankingCredit;
+    // Tax on distribution: investor pays tax on net distribution + franking credits
+    const grossedUpDist = ghhfNetDistribution + ghhfFrankingCredit;
+    const taxOnDist = grossedUpDist * (marginalRate + MEDICARE_LEVY) - ghhfFrankingCredit;
+    ghhfTotalTaxOnDividends += taxOnDist;
     // 6. DCA: new equity + proportional new borrowing to maintain target LVR
     const dcaNewGross = dcaMonthly * grossExposure;
     const dcaNewDebt = dcaNewGross - dcaMonthly;
